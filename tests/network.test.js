@@ -114,3 +114,43 @@ test("ordinary request skips search and keeps dialogue history", async t => {
 test("short follow-up search retains previous subject", () => {
   assert.match(searchQuery("А что сегодня?", [{ role: "user", text: "Заседание Конгресса" }]), /Заседание Конгресса А что сегодня/);
 });
+
+test("a hung first generation recovers automatically without repeating the user question", async t => {
+  const requests = [];
+  const logs = setup(t, async (_, options) => {
+    requests.push(JSON.parse(options.body));
+    return requests.length === 1 ? new Promise(() => {}) : answer();
+  });
+  const history = [{ role: 'user', text: 'Дважды два?' }, { role: 'model', text: 'Четыре.' }];
+  const started = performance.now();
+  const result = await post('Умножь результат на три', history);
+  assert.match(result.response.text, /Ответ по найденному/);
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests[0].contents, requests[1].contents);
+  assert.equal(requests[1].generationConfig.maxOutputTokens, 160);
+  assert.equal(result.session_state.history.length, 4);
+  assert.ok(performance.now() - started < 3800);
+  assert.ok(logs.some(x => x.event === 'recovery_success'));
+});
+
+test("temporary Gemini failure recovers using the same search results and history", async t => {
+  const generations = [];
+  setup(t, async (url, options) => {
+    if (url.includes('serper')) return Response.json({ answerBox: { answer: 'Актуальный факт' } });
+    generations.push(JSON.parse(options.body));
+    return generations.length === 1 ? new Response('unavailable', { status: 503 }) : answer();
+  });
+  const result = await post('Найди новости сегодня');
+  assert.match(result.response.text, /Ответ по найденному/);
+  assert.equal(globalThis.fetch.mock.callCount(), 3);
+  assert.deepEqual(generations[0].contents, generations[1].contents);
+  assert.match(generations[1].contents.at(-1).parts[0].text, /Актуальный факт/);
+});
+
+for (const status of [400, 401, 403, 429]) {
+  test(`Gemini HTTP ${status} does not waste time retrying permanent or quota errors`, async t => {
+    setup(t, async () => new Response('provider failure', { status }));
+    await post('Расскажи сказку');
+    assert.equal(globalThis.fetch.mock.callCount(), 1);
+  });
+}
