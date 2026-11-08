@@ -7,6 +7,7 @@ const SERPER_TIMEOUT_MS = 1400;
 const GEMINI_TIMEOUT_MS = 2500;
 const GEMINI_RESERVED_MS = 2200;
 const RESPONSE_RESERVE_MS = 150;
+const RECOVERY_RESERVE_MS = 1000;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -153,7 +154,7 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
-async function askGemini(text, history, searchContext, timeoutMs) {
+async function askGemini(text, history, searchContext, timeoutMs, recovery = false) {
   const startedAt = Date.now();
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
@@ -185,7 +186,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
         contents,
         generationConfig: {
           temperature: 0.5,
-          maxOutputTokens: 240
+          maxOutputTokens: recovery ? 160 : 240
         }
       })
     },
@@ -201,6 +202,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     networkLog("gemini", "http_error", startedAt, { status });
     if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
     if (status === 429) throw new Error("GEMINI_QUOTA");
+    if (status >= 500) throw new Error("GEMINI_TEMPORARY_FAILURE");
     throw new Error("GEMINI_REQUEST_FAILED");
   }
 
@@ -218,6 +220,26 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     console.warn("Gemini reached the output token limit.");
   }
   return answer;
+}
+
+async function answerWithRecovery(text, history, searchContext, remainingMs) {
+  const available = Math.max(0, remainingMs() - RESPONSE_RESERVE_MS);
+  // Reserve one bounded recovery attempt; never restart search or drop dialogue context.
+  const firstBudget = available >= 1800 ? available - RECOVERY_RESERVE_MS : available;
+  try {
+    return await askGemini(text, history, searchContext, Math.min(GEMINI_TIMEOUT_MS, firstBudget));
+  } catch (error) {
+    const transient = error?.code === "REQUEST_TIMEOUT" || error?.name === "AbortError" ||
+      error instanceof TypeError || error instanceof SyntaxError ||
+      ["GEMINI_TEMPORARY_FAILURE", "GEMINI_EMPTY_RESPONSE"].includes(error?.message);
+    const recoveryBudget = remainingMs() - RESPONSE_RESERVE_MS;
+    if (!transient || recoveryBudget < 400) throw error;
+    const startedAt = Date.now();
+    networkLog("gemini", "automatic_recovery", startedAt);
+    const answer = await askGemini(text, history, searchContext, recoveryBudget, true);
+    networkLog("gemini", "recovery_success", startedAt);
+    return answer;
+  }
 }
 
 function errorForUser(error) {
@@ -277,11 +299,11 @@ export default async function handler(req, res) {
       ));
     }
 
-    const answer = await askGemini(
+    const answer = await answerWithRecovery(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - RESPONSE_RESERVE_MS))
+      remainingMs
     );
 
     const history = [
